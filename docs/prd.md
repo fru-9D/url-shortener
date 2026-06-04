@@ -1,8 +1,8 @@
 # Snip — URL Shortener PRD
 
 **Author:** Product
-**Status:** Draft v4
-**Last updated:** 2026-06-01
+**Status:** Draft v5
+**Last updated:** 2026-06-04
 
 ## Overview
 
@@ -24,6 +24,7 @@ The product targets teams of 5–50 employees who run campaigns across email, so
 | **Click** | One successful redirect event (GET on `/<short-code>` returning a 30x). |
 | **Activated Workspace** | A Workspace whose creator has verified their email **and** which has created at least one link. The denominator for all "activation"-based success metrics. |
 | **User** | A signed-up Snip account, before and independently of Workspace membership. In feature descriptions, "Member" refers to a User who currently belongs to a Workspace. |
+| **Paid** | A Workspace that has subscribed to a paid plan. In v1 this state is tracked manually via a CRM/ops process outside Snip; no billing system exists within v1. Used only in the conversion-to-paid success metric. |
 
 ## Target users
 
@@ -40,11 +41,13 @@ Secondary users are the marketing manager's teammates — content writers, socia
 | Goal | Metric | Target (by end of month 6) |
 |---|---|---|
 | Make link creation fast | Median paste-to-copy time per link | < 5 seconds |
-| Drive habitual use | Workspaces creating ≥ 3 links in week 1 | ≥ 60% of activated Workspaces |
+| Drive habitual use | Workspaces creating ≥ 3 links in their first 7 calendar days after activation | ≥ 60% of activated Workspaces |
 | Reliable redirect path | p95 redirect latency, server-side | < 100ms globally |
 | Reliable redirect path | Redirect endpoint monthly availability | ≥ 99.95% |
-| Useful analytics | Workspaces who open a link detail page in week 1 | ≥ 40% of activated Workspaces |
-| Conversion to paid | Activated Workspaces who convert to paid by week 8 | ≥ 5% |
+| Useful analytics | Workspaces who open a link detail page in their first 7 calendar days after activation | ≥ 40% of activated Workspaces |
+| Conversion to paid ¹ | Activated Workspaces who convert to paid by week 8 after activation | ≥ 5% |
+
+¹ Billing and paid plans are out of scope for v1 (§Out of scope). This metric is tracked manually via a CRM/ops process external to Snip. The Snip application does not record or expose paid status in v1.
 
 ## User flows
 
@@ -52,17 +55,17 @@ Secondary users are the marketing manager's teammates — content writers, socia
 
 1. **Trigger.** A signed-in Member opens the Snip dashboard at `/links`.
 2. **Action.** They paste a destination URL into the create-link input and either (a) leave the slug field empty for auto-generation, or (b) type a custom slug.
-3. **System response.** On submit, the link-creation API validates the URL, generates or accepts the short code, persists the link, and returns the Short URL. The dashboard displays the new Short URL with a Copy button focused.
+3. **System response.** On submit, the link-creation API validates the URL, runs the Google Safe Browsing check (fail-open — see §Link creation), generates or accepts the short code, persists the link, and returns the Short URL. The dashboard displays the new Short URL with a Copy button focused.
 4. **End state.** The new link appears at the top of the Workspace's link list.
 
-**Failure path.** If the API returns an error (validation failure, rate limit, or storage error), the form remains open and shows the relevant inline error message (see Error scenarios). No partial link is created.
+**Failure paths.** If the API returns an error (validation failure, rate limit, or storage error), the form remains open and shows the relevant inline error message (see Error scenarios). No partial link is created. If the Member's session expires mid-flow, the API returns 401; the dashboard redirects to the sign-in page with the message "Session expired — please sign in again." The partially entered URL is not preserved.
 
 ### Flow B — Anonymous visitor follows a short URL
 
 1. **Trigger.** A browser requests `https://snip.io/<short-code>`.
 2. **Action.** The redirect service looks up the short code.
-3. **System response.** On hit, the redirect service emits a click event synchronously to the click pipeline, then returns a `302 Found` with `Location: <destination-url>`. On miss or soft-delete, returns a branded 404 page.
-4. **End state.** The visitor is redirected to the destination URL; the click ingest service records the click in the analytics store within 60 seconds.
+3. **System response.** On hit, the redirect service publishes a click event to the async click pipeline (SQS queue), then returns a `302 Found` with `Location: <destination-url>`. On miss or soft-delete, returns a branded 404 page. On ops-disabled link, returns a branded 404 page (same appearance; the disabled state is not surfaced to visitors).
+4. **End state.** The visitor is redirected to the destination URL; the click ingest service records the click in the analytics store within 60 seconds of the redirect (end-to-end).
 
 **Failure paths.** If the redirect datastore is unreachable, the redirect service returns a `503` page (not a branded 404). If the click pipeline is unavailable, the click event is durably queued locally; the 302 redirect still completes immediately.
 
@@ -73,6 +76,32 @@ Secondary users are the marketing manager's teammates — content writers, socia
 3. **System response.** The link-detail page loads showing click count, a time-series chart of clicks per UTC day for the last 30 days, and a country breakdown.
 4. **End state.** Member sees up-to-date analytics (data freshness: ≤ 60 seconds behind real-time).
 
+**Failure paths.** If the analytics query returns a 5xx error, the page renders the link metadata (short code, destination URL, created date, creator) and shows "Analytics temporarily unavailable. Try again in a minute." in the chart area; the click count displayed is the last-known cached value. If a Member attempts to view a link detail page that belongs to a different Workspace, the API returns 403 and the dashboard renders the branded 404 page (cross-workspace link existence is not disclosed). If the short code does not exist in the Workspace, the API returns 404 and the dashboard renders the branded 404 page.
+
+### Flow D — New user signs up and verifies email
+
+1. **Trigger.** A visitor opens the sign-up page at `/signup`.
+2. **Action.** They enter an email address and password and click Create account.
+3. **System response.** The API validates the email format and checks it is not already registered. It checks the password against Pwned Passwords (fail-open per §Account). It hashes the password with Argon2id, creates the User record (unverified), and dispatches a verification email containing a single-use link valid for 24 hours.
+4. **End state.** The user is signed in. Until their email is verified, a persistent banner reads "Please verify your email." Link creation and Workspace features are gated until verification completes.
+
+**Verification step.** When the user clicks the verification link in the email, the API marks `email_verified_at` and removes the gate. If the user has no Workspace yet, they are redirected to `/onboarding` (§Flow E); if they already belong to one (e.g., accepted an invite before verifying), they are redirected to `/links`.
+
+**Failure paths.**
+- Email already registered → inline form error (§Account error scenarios).
+- Pwned password detected → inline form error (§Account error scenarios).
+- Verification link expired (> 24 hours) → user is shown: "This link has expired. Sign in and we'll send a fresh one."
+- Verification email fails to deliver → sign-up succeeds; banner: "We couldn't send your verification email. We'll retry — or click here to resend."
+
+### Flow E — Verified user creates a Workspace
+
+1. **Trigger.** A signed-in, email-verified User who does not yet belong to a Workspace lands on `/onboarding`. They are redirected here automatically after email verification or on any authenticated visit before Workspace membership is established.
+2. **Action.** They enter a Workspace name and click Create workspace.
+3. **System response.** The API creates the Workspace, adds the user as the first Admin via a WORKSPACE_MEMBER record, and redirects to `/links`.
+4. **End state.** The user is now a Member (Admin role) of a new Workspace and sees an empty link list.
+
+**Failure paths.** A user who already belongs to a Workspace cannot reach `/onboarding` — the dashboard redirects them to `/links`. If the Workspace creation API call fails (5xx), the form remains open with the toast: "Something went wrong on our end. Please try again."
+
 ## Features
 
 ### Link creation
@@ -82,8 +111,9 @@ Secondary users are the marketing manager's teammates — content writers, socia
 - Given a signed-in Member submits an `http://` or `https://` URL of ≤ 2048 characters, when they click Create, then the system returns a Short URL and the new link is visible in the Workspace's link list.
 - The auto-generated short code is exactly 7 characters from the alphabet `[A-Za-z0-9]` (nanoid-style).
 - A custom slug must match `^[A-Za-z0-9_-]{3,32}$`. Slugs are case-sensitive and unique globally across `snip.io`. Case-variants of the same string (`Foo` and `foo`) are treated as distinct slugs and may both exist simultaneously.
-- Reserved prefixes (cannot be used as slugs): `admin`, `api`, `app`, `auth`, `dashboard`, `help`, `login`, `logout`, `settings`, `signup`, `static`, `www`.
-- A previously deleted slug becomes reusable after 30 days.
+- Reserved words (cannot be used as slugs, exact-match only, case-insensitive): `admin`, `api`, `app`, `auth`, `dashboard`, `help`, `login`, `logout`, `settings`, `signup`, `static`, `www`. For example, `Admin`, `API`, and `admin` are all reserved. Prefix-based matching is not applied — `adminpanel` is not reserved.
+- A previously deleted slug becomes reusable after 30 days. During the 30-day window the slug returns a branded 404 to visitors (same appearance as a non-existent slug).
+- The rate limit for link creation is a **sliding window**: 60 links per rolling 60-second window per authenticated user, keyed by user ID.
 - Only schemes `http:` and `https:` are accepted. `ftp:`, `javascript:`, `data:`, `file:`, and others are rejected.
 - IDN hosts are accepted and stored in punycode form.
 - Submitting the same Destination URL twice by the same Member creates a second short code; deduplication is not performed.
@@ -98,6 +128,7 @@ Secondary users are the marketing manager's teammates — content writers, socia
 | URL > 2048 chars | Inline form error: "URL is too long. Maximum 2048 characters." |
 | Custom slug taken | Inline form error on slug field: "That short link is already in use. Try a different one." |
 | Custom slug malformed | Inline form error: "Short links must be 3–32 letters, numbers, hyphens, or underscores." |
+| Custom slug is a reserved word | Inline form error on slug field: "That short link is reserved. Try a different one." |
 | Destination on blocklist | Inline form error: "We can't shorten this link. Contact support if you think this is a mistake." |
 | Rate-limited (> 60 links/min/user) | HTTP 429 + toast: "You're creating links faster than allowed. Try again in a minute." |
 | Storage write failure | HTTP 500 + toast: "Something went wrong on our end. We've logged it — please try again." |
@@ -119,13 +150,34 @@ Secondary users are the marketing manager's teammates — content writers, socia
 | List API 5xx | Skeleton state + retry button. Retry uses exponential backoff up to 3 attempts. |
 | Filter returns zero results | Empty state: "No links match this filter. Try a wider range." |
 
+### Link editing
+
+**Acceptance criteria:**
+
+- Any Member (Admin or Editor) may edit the destination URL of any link in their Workspace.
+- Only the destination URL is editable. The short code is immutable after creation; changing it would break already-distributed links.
+- Editing a destination URL re-runs the Google Safe Browsing check with the same 800ms timeout and fail-open policy as link creation.
+- The updated destination URL must pass the same validation rules as link creation (scheme, length ≤ 2048, format).
+- Editing does not reset the link's click count, `created_at`, or short code.
+
+**Error scenarios:**
+
+| Failure | User-visible behavior |
+|---|---|
+| Updated URL syntax invalid | Inline form error: "That doesn't look like a URL. Make sure it starts with http:// or https://." |
+| Updated URL scheme not allowed | Inline form error: "Only http and https links are supported." |
+| Updated URL > 2048 chars | Inline form error: "URL is too long. Maximum 2048 characters." |
+| Updated URL on blocklist | Inline form error: "We can't use this link. Contact support if you think this is a mistake." |
+| Edit API 5xx | Toast: "Something went wrong on our end. We've logged it — please try again." |
+
 ### Click analytics
 
 **Acceptance criteria:**
 
 - A click is any `GET /<short-code>` that returns a 30x response. `HEAD` requests are excluded.
-- Bot User-Agents matching the IAB / ABC International Spiders & Bots List are excluded from the displayed count, but raw counts are still stored.
+- Bot User-Agents matching the IAB / ABC International Spiders & Bots List (updated with each GeoLite2 DB pull) are excluded from the displayed count, but raw click rows are still stored with `is_bot = true`. Bot detection is applied by the click ingest consumer, not the redirect service, to avoid adding latency on the redirect path. The redirect service includes the raw User-Agent string in the click event payload; the consumer evaluates it and sets `is_bot` before persisting the row.
 - Click counts on the detail page are accurate within ≤ 60 seconds of real-time (see Click pipeline — ingest SLO and visibility SLO).
+- The redirect service always has the LINK row in hand before emitting the click event and includes `workspace_id` directly in the event payload; no secondary lookup is needed for anonymous clicks.
 - The time-series chart uses UTC-day buckets for the last 30 days.
 - Country is derived from the requester IP via MaxMind GeoLite2. When IP is unresolvable, the country bucket is "Unknown".
 
@@ -137,6 +189,22 @@ Secondary users are the marketing manager's teammates — content writers, socia
 | Detail page analytics query 5xx | Page renders the link metadata but shows "Analytics temporarily unavailable. Try again in a minute." in the chart slot. |
 | Link does not exist | 404 page. |
 
+### Abuse review queue
+
+The abuse review queue is an internal ops tool, not visible to Workspace Members. It is populated when the Google Safe Browsing check flags a link (fail-open path) or via manual ops escalation.
+
+**Acceptance criteria:**
+
+- A flagged link is added to the queue with status `pending_review`. While pending, the link redirects normally (fail-open per §Link creation).
+- Trust-and-safety reviewers have 24 hours from flag time to act on each entry. No automated action is taken on SLA breach; an ops alert fires.
+- Reviewer actions and their effects:
+  - **Whitelist:** No change to the live link; entry is marked `whitelisted`. The link redirects normally.
+  - **Disable:** Sets `disabled_at` on the LINK row; entry is marked `disabled`. The link returns a branded 404 to visitors. The slug-reuse clock is not started (disable is reversible). The link owner is not notified in v1.
+  - **Hard-delete:** Permanently deletes the LINK row; entry is marked `hard_deleted`. The short code is freed immediately (does not enter the 30-day reuse window). The link owner is not notified in v1.
+- A disabled link can be re-enabled (whitelisted) by a reviewer, which clears `disabled_at`.
+- If a link accumulates multiple review records (e.g., flagged → whitelisted → flagged again), the most-recent entry is the operative state.
+- The Cloudflare edge cache must be purged when a link is disabled or hard-deleted (handled by the ops action, not eventual TTL expiry).
+
 ### Teams (Workspaces)
 
 **Acceptance criteria:**
@@ -147,14 +215,16 @@ Secondary users are the marketing manager's teammates — content writers, socia
 - An invite expires 7 days after creation. Re-inviting a still-pending email replaces the existing invite (resets the 7-day clock). Recipients can accept or decline an invite via links in the invitation email. Declining marks the invite `declined`; the declined email is immediately eligible for re-invite by the Workspace Admin.
 - An Admin can remove a Member. Removed Members lose access immediately (active sessions are invalidated at the moment of removal). Their links remain in the Workspace, and the system atomically reassigns `owner_id` to the Admin performing the removal. Any pending invites sent by the removed Member are cancelled immediately. The removed Member's email address is immediately eligible for re-invite.
 - A Workspace must have at least 1 Admin at all times. The last Admin cannot remove themselves and cannot demote themselves. This constraint is enforced at the API layer and applies to all surfaces, including operator and support tooling.
-- Inviting an email that already has a Snip account in a different Workspace is allowed only if Workspace switching has shipped — for v1, the invite returns an error directing the user to use a different email.
+- Inviting an email that already has a Snip account in a different Workspace is not allowed in v1; the invite returns an error (see error scenarios below).
+- Admins can promote an Editor to Admin or demote an Admin to Editor. An Admin cannot demote themselves if they are the last Admin (same constraint as self-removal, enforced at the API layer). Changing a Member's role does not invalidate their sessions.
+- When an invited recipient clicks the accept link in their invitation email: (a) if the recipient has no Snip account, they are directed to sign up; upon completing sign-up they are immediately added to the Workspace; (b) if the recipient has a Snip account and is not signed in, they are directed to sign in; upon sign-in they are added to the Workspace; (c) if the recipient is already signed in with the matching account, they are added immediately. An accepted invite token is consumed on first use; replaying the link after acceptance returns the "expired" error.
 
 **Error scenarios:**
 
 | Failure | User-visible behavior |
 |---|---|
 | Invite to email already pending | "That invite is still active. You can resend or cancel it from the Members page." |
-| Invite to email already in another Workspace (v1) | "That email is already associated with another Snip account. Ask them to use a different email or sign in." |
+| Invite to email already in another Workspace (v1) | "That email already belongs to another Snip workspace. They would need to leave that workspace first, or use a different email address." |
 | Last-Admin self-removal attempt | "You're the only Admin. Promote another Member to Admin first." |
 | Invite link expired | Recipient sees: "This invite has expired. Ask the Workspace Admin to resend it." |
 | Recipient declines invite | Invite is marked declined; Workspace inviter sees the declined state in the Members page. Declined email is immediately eligible for re-invite. |
@@ -167,9 +237,11 @@ Secondary users are the marketing manager's teammates — content writers, socia
 - Sign-up requires email + password. Email verification is required before the user can create any links; until verified, the user can sign in but only sees a "Please verify your email" gate.
 - Password policy: minimum 12 characters, no character-class requirement, but each password is checked against the Pwned Passwords k-anonymity API and rejected if found.
 - Passwords are stored as Argon2id hashes.
-- Password reset is initiated by entering an email; if the email exists, a single-use reset token is mailed. Token TTL: 60 minutes. Token is single-use. The reset link form does not reveal whether the email exists ("If that email is registered, we've sent a reset link").
-- Failed-login throttling: 5 failed attempts per email per 15 minutes triggers a 15-minute lockout. Lockout is per-email, not per-IP.
-- Sessions: HTTP-only secure cookie, 30-day absolute expiry, 7-day idle expiry.
+- Password reset is initiated by entering an email; if the email exists, a single-use reset token is mailed. Token TTL: 60 minutes. Token is single-use. The reset link form does not reveal whether the email exists ("If that email is registered, we've sent a reset link"). Requesting a new reset link while an earlier token is still within its TTL invalidates the earlier token immediately; only the most-recently issued token is valid.
+- Password reset for an account with an unverified email proceeds normally — the reset email is sent to the unverified address, and on successful reset, `email_verified_at` is set (the reset proves the user controls the inbox).
+- Failed-login throttling: 5 failed attempts per email per 15 minutes triggers a 15-minute lockout. Lockout is per-email, not per-IP. The lockout error response does not disclose whether the email address exists.
+- Sessions: HTTP-only secure cookie, 30-day absolute expiry, 7-day idle expiry. The idle timer resets on every authenticated API request ("idle" means no authenticated request for 7 consecutive days).
+- Changing a password while signed in bumps `session_version` and re-issues the current session; the active browser stays signed in but all other sessions are invalidated immediately. Completing a password reset via the email link bumps `session_version`, invalidating all existing sessions; a new session is issued upon successful form submission.
 
 **Error scenarios:**
 
@@ -178,6 +250,7 @@ Secondary users are the marketing manager's teammates — content writers, socia
 | Sign-up email already exists | "An account with that email already exists. Sign in or reset your password." |
 | Pwned password detected | Inline form error: "This password has appeared in a known data breach. Please choose a different one." |
 | Reset token used or expired | Reset page shows: "This reset link is no longer valid. Request a new one." |
+| Account locked out (≥ 5 failed attempts) | HTTP 429 + inline form error: "Too many failed sign-in attempts. Try again in X minutes." (X = whole minutes remaining, rounded up). The message does not confirm that the email address exists. |
 | Email-verification link expired | "This link has expired. Sign in and we'll send a fresh one." |
 
 ## External integrations
@@ -224,7 +297,7 @@ Email delivery is a hard dependency of Account (verification + reset) and Teams 
 **Sender identity.** All transactional mail from `noreply@snip.io`, signed with DKIM, with SPF and DMARC records published.
 **Suppression enforcement.** Before queuing any outbound email, the application checks the internal suppression list; addresses marked suppressed are silently skipped. The SES account-level suppression list is not the primary enforcement point.
 
-**Failure handling.** SES bounces and complaints are routed to an SNS topic consumed by a `mail_events` worker that marks the recipient address as suppressed. The user-visible behavior on failure depends on context:
+**Failure handling.** SES bounces and complaints are routed to an SNS topic, which fans out to an SQS queue consumed by the `mail_events` worker that marks the recipient address as suppressed. If SNS → SQS delivery fails (SNS retries exhausted), the bounce or complaint notification is dropped and the address is not suppressed — this is an acceptable low-frequency risk. The SNS topic is in the same AWS region as SES. SNS message payloads contain the recipient email address for suppression-list lookup only; payloads are not logged and the SNS topic has no CloudWatch Logs subscription. The user-visible behavior on failure depends on context:
 - **Verification email failed to send:** Sign-up succeeds, banner on next page: "We couldn't send your verification email. We'll retry in 5 minutes — or click here to resend."
 - **Reset email failed to send:** Generic "If that email is registered, we've sent a reset link" message (do not reveal failure to the requester; ops alert fires).
 - **Invite email failed to send:** Admin sees the invite in `failed` state on the Members page with a "Resend" action.
@@ -241,16 +314,33 @@ Used by the redirect service to populate the `country_code` on click events.
 **Fallback.** When the local DB is missing, stale by > 30 days, or returns no match, the `country_code` is recorded as `"Unknown"`. Stale-DB events trigger an ops alert at the 21-day mark.
 **License.** GeoLite2 free tier; attribution requirement satisfied in the public Privacy page.
 
+### Google Safe Browsing v4 — URL reputation check
+
+Used by the link-creation API (and link-edit API) to screen destination URLs.
+
+**Transport.** Server-side HTTPS POST to the Safe Browsing Lookup API v4 (`/v4/threatMatches:find`). Only the host and path of the destination URL are sent; query-string parameters are stripped before the request to prevent PII in query strings from being transmitted to a third party.
+**Auth.** API key stored in AWS Secrets Manager; injected as an environment variable at ECS task start.
+**Timeout.** 800ms per request.
+**Retry.** No retry on timeout — the latency budget forbids it. A single retry on transient network error (non-timeout) with immediate backoff.
+**Fail-open.** On timeout, network error after the single retry, or any API error response, the link is created and silently added to the Abuse review queue for manual inspection within 24 hours. The user sees no indication that the check was skipped.
+**Failure impact.** A Safe Browsing API outage increases Abuse review queue volume but does not block link creation. An ops alert fires when Abuse queue depth exceeds threshold.
+
+### AWS KMS — encryption key management
+
+Used to seal per-row DEKs for email `email_ciphertext` fields (§Security NFR).
+
+**Failure contract.** KMS is treated as a hard dependency for write operations that encrypt email addresses (sign-up, invite creation). If KMS is unreachable during a write, the operation fails with a 500 error — no plaintext email is written to the database. Read operations that cannot decrypt `email_ciphertext` (e.g., login, password reset lookup) also fail with a 500; the failure is logged and an ops alert fires.
+
 ### Click pipeline — internal ingest bus
 
 The redirect service publishes a click event to the click ingest service immediately after emitting the 302 response. The click ingest service writes to the analytics store.
 
 **Transport.** Async queue (SQS or equivalent). The redirect service is the sole producer; the click ingest service is the sole consumer.
-**Message schema.** Each event carries: `short_code`, `workspace_id`, `link_id`, `country_code`, `is_bot` (bool), `referrer_host`, `clicked_at` (RFC 3339 UTC).
+**Message schema.** Each event carries: `short_code`, `workspace_id`, `link_id`, `country_code`, `user_agent` (raw string, for bot detection by the consumer), `is_bot` (bool, set by the ingest consumer after evaluating `user_agent`), `referrer_host`, `clicked_at` (RFC 3339 UTC).
 **Durability.** At-least-once delivery. The ingest consumer is idempotent on `(link_id, clicked_at)`.
 **Ordering.** Best-effort; out-of-order delivery is acceptable for a time-series use case.
 **Ingest SLO.** Click written to the durable queue ≤ 2 seconds after the 302 response.
-**Visibility SLO.** Analytics store reflects all queued clicks within 60 seconds of ingest. This is the ≤ 60-second freshness budget referenced in Flows B and C and the Click analytics AC.
+**Visibility SLO.** Analytics store reflects all queued clicks within 60 seconds of the click event (end-to-end from the 302 response). The ingest leg consumes ≤ 2 seconds of this budget; the consumer-to-store leg must complete within the remaining ≤ 58 seconds. This 60-second end-to-end figure is the freshness budget referenced in Flows B and C and the Click analytics AC.
 **Throughput.** Sized for redirect p95 traffic × 2 headroom.
 **Failure.** If the queue is unavailable at emit time, the redirect service falls back to local durable buffering and retries when the queue recovers. See "Click pipeline ingest failure" in Click analytics error scenarios.
 
@@ -258,7 +348,7 @@ The redirect service publishes a click event to the click ingest service immedia
 
 - **Performance.** Redirect p95 < 100ms server-side globally; dashboard initial-render p95 < 2s on mid-tier mobile over 4G (Lighthouse "Slow 4G" throttle profile, Moto G Power-class device).
 - **Availability.** Redirect endpoint ≥ 99.95% monthly. Dashboard ≥ 99.5% monthly.
-- **Security.** TLS 1.2+ everywhere. Passwords hashed with Argon2id. Email addresses encrypted at rest (AES-256-GCM at the application layer; keys managed via AWS KMS). Sessions in HTTP-only, Secure, SameSite=Lax cookies. CSRF protection on all mutating endpoints. OWASP Top-10 2021 baseline, verified by SAST tooling on every release.
+- **Security.** TLS 1.2+ everywhere. Passwords hashed with Argon2id. Email addresses encrypted at rest (AES-256-GCM at the application layer; DEKs sealed by AWS KMS; KMS is a hard dependency for email write/read operations — see §AWS KMS). Sessions in HTTP-only, Secure, SameSite=Lax cookies. CSRF protection on all mutating endpoints. OWASP Top-10 2021 baseline, verified by SAST tooling (Bandit for Python, semgrep ruleset for both surfaces) on every CI release build.
 - **Data retention.** Click events: 13 months rolling. Audit fields (`created_at`, `updated_at`): indefinite. Deleted links: soft-delete for 30 days, then hard-delete.
 
 ## Out of scope for v1
