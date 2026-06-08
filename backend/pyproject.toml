@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "snip-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    # Web framework — starlette>=1.0.1 required for Host-header CVE fix
+    "fastapi>=0.115.12",
+    "uvicorn[standard]==0.32.1",
+    # Database
+    "sqlalchemy==2.0.36",
+    "asyncpg==0.30.0",
+    "alembic==1.14.0",
+    # Redis
+    "redis==5.2.1",
+    # Auth / crypto — cryptography>=46.0.6 required for CVE-2026-34073 and CVE-2026-26007 fixes
+    "argon2-cffi==23.1.0",
+    "cryptography>=46.0.6",
+    # AWS
+    "boto3==1.35.74",
+    "botocore==1.35.74",
+    # HTTP client
+    "httpx==0.28.0",
+    # Data validation
+    "pydantic==2.10.2",
+    "pydantic-settings==2.6.1",
+    "email-validator==2.2.0",
+    # Nanoid
+    "nanoid==2.0.0",
+    # Structured logging
+    "structlog==24.4.0",
+    # Sentry
+    "sentry-sdk[fastapi]==2.18.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.0",
+    "factory-boy==3.3.1",
+    "faker==33.0.0",
+    "ruff==0.8.2",
+    "mypy==1.13.0",
+    "bandit==1.8.0",
+    "types-redis==4.6.0.20241004",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "S", "B", "A", "C4", "DTZ", "T20", "RET", "SIM"]
+ignore = [
+    "S101",   # assert in tests
+    "S105",   # possible hardcoded password (false positives on env var names)
+    "S106",   # same
+    "F821",   # undefined name — SQLAlchemy forward-reference strings in relationship()
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=app --cov-report=term-missing"
+
+[tool.coverage.run]
+omit = ["tests/*", "alembic/*"]

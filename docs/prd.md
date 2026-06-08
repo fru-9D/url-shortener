@@ -1,7 +1,7 @@
 # Snip — URL Shortener PRD
 
 **Author:** Product
-**Status:** Draft v5
+**Status:** Draft v6
 **Last updated:** 2026-06-04
 
 ## Overview
@@ -40,7 +40,7 @@ Secondary users are the marketing manager's teammates — content writers, socia
 
 | Goal | Metric | Target (by end of month 6) |
 |---|---|---|
-| Make link creation fast | Median paste-to-copy time per link | < 5 seconds |
+| Make link creation fast | Median paste-to-copy time per link (client-side: elapsed time from paste event on the URL input to user clicking the Copy button, measured by frontend performance instrumentation) | < 5 seconds |
 | Drive habitual use | Workspaces creating ≥ 3 links in their first 7 calendar days after activation | ≥ 60% of activated Workspaces |
 | Reliable redirect path | p95 redirect latency, server-side | < 100ms globally |
 | Reliable redirect path | Redirect endpoint monthly availability | ≥ 99.95% |
@@ -170,6 +170,22 @@ Secondary users are the marketing manager's teammates — content writers, socia
 | Updated URL on blocklist | Inline form error: "We can't use this link. Contact support if you think this is a mistake." |
 | Edit API 5xx | Toast: "Something went wrong on our end. We've logged it — please try again." |
 
+### Link deletion
+
+**Acceptance criteria:**
+
+- Any Member (Admin or Editor) may delete any link in their Workspace.
+- Deletion is a soft-delete: `deleted_at` is set and the link disappears from the Workspace link list immediately. The short code returns a branded 404 to visitors for 30 days; after 30 days the scheduled hard-delete job removes the row and frees the short code for reuse.
+- If the link being deleted has an open `pending_review` entry in the Abuse review queue, the delete is permitted; the queue entry is automatically transitioned to `hard_deleted` status — no separate reviewer action is required.
+- Soft-deleted links cannot be restored in v1.
+- Click history for deleted links is preserved in the analytics store until the 13-month rolling-delete job removes it.
+
+**Error scenarios:**
+
+| Failure | User-visible behavior |
+|---|---|
+| Deletion API 5xx | Toast: "Something went wrong. Please try again." The link is not deleted. |
+
 ### Click analytics
 
 **Acceptance criteria:**
@@ -203,13 +219,14 @@ The abuse review queue is an internal ops tool, not visible to Workspace Members
   - **Hard-delete:** Permanently deletes the LINK row; entry is marked `hard_deleted`. The short code is freed immediately (does not enter the 30-day reuse window). The link owner is not notified in v1.
 - A disabled link can be re-enabled (whitelisted) by a reviewer, which clears `disabled_at`.
 - If a link accumulates multiple review records (e.g., flagged → whitelisted → flagged again), the most-recent entry is the operative state.
-- The Cloudflare edge cache must be purged when a link is disabled or hard-deleted (handled by the ops action, not eventual TTL expiry).
+- The Cloudflare edge cache must be purged when a link is disabled or hard-deleted. The Link API backend calls the Cloudflare Cache Purge API synchronously as part of the disable/hard-delete operation (see §Cloudflare — edge cache purge). The operational database change is committed regardless of whether the purge succeeds; a failed purge triggers an ops alert.
 
 ### Teams (Workspaces)
 
 **Acceptance criteria:**
 
 - Every Member belongs to exactly one Workspace in v1. Workspace switching is out of scope. A signed-in Member who already belongs to a Workspace cannot create an additional Workspace — the create-Workspace option is not surfaced in the UI for existing Members.
+- Workspace names: minimum 2 characters, maximum 64 characters, Unicode display characters allowed (no control characters). Workspace names are not required to be globally unique — two Workspaces may share the same name in v1.
 - Roles: **Admin** and **Editor**. The Workspace's creator is the first Admin.
 - Admins can invite Editors and other Admins by email. Editors can create/edit/delete links but cannot manage Members.
 - An invite expires 7 days after creation. Re-inviting a still-pending email replaces the existing invite (resets the 7-day clock). Recipients can accept or decline an invite via links in the invitation email. Declining marks the invite `declined`; the declined email is immediately eligible for re-invite by the Workspace Admin.
@@ -217,7 +234,7 @@ The abuse review queue is an internal ops tool, not visible to Workspace Members
 - A Workspace must have at least 1 Admin at all times. The last Admin cannot remove themselves and cannot demote themselves. This constraint is enforced at the API layer and applies to all surfaces, including operator and support tooling.
 - Inviting an email that already has a Snip account in a different Workspace is not allowed in v1; the invite returns an error (see error scenarios below).
 - Admins can promote an Editor to Admin or demote an Admin to Editor. An Admin cannot demote themselves if they are the last Admin (same constraint as self-removal, enforced at the API layer). Changing a Member's role does not invalidate their sessions.
-- When an invited recipient clicks the accept link in their invitation email: (a) if the recipient has no Snip account, they are directed to sign up; upon completing sign-up they are immediately added to the Workspace; (b) if the recipient has a Snip account and is not signed in, they are directed to sign in; upon sign-in they are added to the Workspace; (c) if the recipient is already signed in with the matching account, they are added immediately. An accepted invite token is consumed on first use; replaying the link after acceptance returns the "expired" error.
+- When an invited recipient clicks the accept link in their invitation email: (a) if the recipient has no Snip account, they are directed to sign up; upon completing sign-up they are immediately added to the Workspace; (b) if the recipient has a Snip account and is not signed in, they are directed to sign in; upon sign-in they are added to the Workspace; (c) if the recipient is already signed in with the matching account, they are added immediately. An accepted invite token is consumed on first use; replaying the link after acceptance returns the "expired" error. **Failure:** if the Workspace-add step fails (5xx) after sign-up or sign-in completes, the user is directed to an error page: "Your account is ready but we couldn't add you to the Workspace. The invitation link is still valid — try clicking it again." The invite token is not consumed on a failed Workspace-add so the user can retry.
 
 **Error scenarios:**
 
@@ -260,6 +277,7 @@ The abuse review queue is an internal ops tool, not visible to Workspace Members
 Mixpanel is used to give Workspace Admins access to advanced reporting that Snip's built-in analytics does not provide. v1 sends a subset of events.
 
 **Transport.** Server-side via Mixpanel's `/track` HTTP API. No client-side SDK.
+**Timeout.** 2000ms per request.
 
 **Events.**
 
@@ -294,6 +312,7 @@ The Account password policy requires that every password create / change be chec
 Email delivery is a hard dependency of Account (verification + reset) and Teams (invites).
 
 **Provider.** AWS SES in v1.
+**Timeout.** 3000ms per SES API call. On timeout, treat as a send failure and follow the per-flow failure path.
 **Sender identity.** All transactional mail from `noreply@snip.io`, signed with DKIM, with SPF and DMARC records published.
 **Suppression enforcement.** Before queuing any outbound email, the application checks the internal suppression list; addresses marked suppressed are silently skipped. The SES account-level suppression list is not the primary enforcement point.
 
@@ -329,7 +348,20 @@ Used by the link-creation API (and link-edit API) to screen destination URLs.
 
 Used to seal per-row DEKs for email `email_ciphertext` fields (§Security NFR).
 
+**Timeout.** 500ms per KMS API call.
+**Retry.** 1 immediate retry on network error. After retry exhaustion the operation fails with a 500 and an ops alert fires.
 **Failure contract.** KMS is treated as a hard dependency for write operations that encrypt email addresses (sign-up, invite creation). If KMS is unreachable during a write, the operation fails with a 500 error — no plaintext email is written to the database. Read operations that cannot decrypt `email_ciphertext` (e.g., login, password reset lookup) also fail with a 500; the failure is logged and an ops alert fires.
+
+### Cloudflare — edge cache purge
+
+Used to invalidate the redirect Worker's regional cache when a link is disabled or hard-deleted by a trust-and-safety reviewer.
+
+**Transport.** HTTPS DELETE to the Cloudflare Cache Purge API (`/client/v4/zones/<zone_id>/purge_cache`). The Link API backend calls this synchronously as part of the reviewer's disable or hard-delete operation, before returning the action response.
+**Auth.** Cloudflare API token with "Cache Purge" permission scoped to the Snip zone, stored in AWS Secrets Manager.
+**Timeout.** 2000ms per request.
+**Retry.** 2 retries with exponential backoff (500ms, 2s) on transient error.
+**Failure semantics.** If the purge call fails after all retries, the database change (disable/hard-delete) is still committed — the operational state is authoritative. The disabled or hard-deleted link may continue to serve from the Cloudflare cache for up to the 5-minute CDN TTL. An ops alert fires immediately; the ops team can manually trigger a zone-wide purge as a fallback.
+**PII treatment.** The purge request body contains only the short code URL (`https://snip.io/<short-code>`); no user or email data is transmitted.
 
 ### Click pipeline — internal ingest bus
 

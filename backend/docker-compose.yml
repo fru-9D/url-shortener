@@ -1,0 +1,124 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: snip
+      POSTGRES_USER: snip
+      POSTGRES_PASSWORD: snip_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U snip"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://snip:snip_dev@db:5432/snip
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-key-change-in-production
+      HMAC_KEY: dev-hmac-key-change-in-production
+      ENVIRONMENT: development
+      CORS_ORIGINS: "http://localhost:3000"
+      # Stub values for external services in dev
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SES_FROM_EMAIL: noreply@snip.io
+      KMS_KEY_ARN: ""
+      GOOGLE_SAFE_BROWSING_API_KEY: ""
+      MIXPANEL_TOKEN: ""
+      CLOUDFLARE_ZONE_ID: ""
+      CLOUDFLARE_API_TOKEN: ""
+      SQS_CLICKS_URL: ""
+      SQS_MIXPANEL_URL: ""
+      SQS_MAIL_EVENTS_URL: ""
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  click-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://snip:snip_dev@db:5432/snip
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-key-change-in-production
+      HMAC_KEY: dev-hmac-key-change-in-production
+      ENVIRONMENT: development
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_CLICKS_URL: ""
+      MIXPANEL_TOKEN: ""
+      SQS_MIXPANEL_URL: ""
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m app.workers.click_consumer
+
+  mixpanel-forwarder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://snip:snip_dev@db:5432/snip
+      ENVIRONMENT: development
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_MIXPANEL_URL: ""
+      MIXPANEL_TOKEN: ""
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m app.workers.mixpanel_forwarder
+
+  mail-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://snip:snip_dev@db:5432/snip
+      ENVIRONMENT: development
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_MAIL_EVENTS_URL: ""
+      HMAC_KEY: dev-hmac-key-change-in-production
+      KMS_KEY_ARN: ""
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m app.workers.mail_worker
+
+volumes:
+  pg_data:
+  redis_data:
